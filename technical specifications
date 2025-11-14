@@ -1,0 +1,779 @@
+# ClassicalStream - Technical Specifications
+
+## System Architecture Overview
+
+### High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    CLIENT LAYER (PWA)                        │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │   React UI   │  │Audio Player  │  │Service Worker│      │
+│  │  Components  │  │    Engine    │  │   (Offline)  │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+└─────────────────────────────────────────────────────────────┘
+                            ↕ HTTPS/WSS
+┌─────────────────────────────────────────────────────────────┐
+│              API GATEWAY / LOAD BALANCER                     │
+│                    (Cloudflare / Nginx)                      │
+└─────────────────────────────────────────────────────────────┘
+                            ↕
+┌─────────────────────────────────────────────────────────────┐
+│                  MICROSERVICES LAYER                         │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
+│  │  Content    │ │   Audio     │ │    Ad       │          │
+│  │  Service    │ │  Delivery   │ │  Service    │          │
+│  └─────────────┘ └─────────────┘ └─────────────┘          │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
+│  │   User      │ │   Search    │ │  Analytics  │          │
+│  │  Service    │ │   Service   │ │   Service   │          │
+│  └─────────────┘ └─────────────┘ └─────────────┘          │
+└─────────────────────────────────────────────────────────────┘
+                            ↕
+┌─────────────────────────────────────────────────────────────┐
+│                    DATA LAYER                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
+│  │  PostgreSQL  │  │     Redis    │  │  S3/R2 CDN   │     │
+│  │  (Metadata)  │  │    (Cache)   │  │(Audio Files) │     │
+│  └──────────────┘  └──────────────┘  └──────────────┘     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Frontend Specifications
+
+### Progressive Web App (PWA)
+
+**Core Technologies:**
+```json
+{
+  "framework": "React 18.2+",
+  "language": "TypeScript 5.0+",
+  "state": "Redux Toolkit + RTK Query",
+  "styling": "Tailwind CSS 3.3+",
+  "audio": "HTML5 Audio API + Media Session API",
+  "pwa": "Workbox 7.0+",
+  "build": "Vite 5.0+"
+}
+```
+
+**PWA Manifest Configuration:**
+```json
+{
+  "name": "ClassicalStream",
+  "short_name": "ClassStream",
+  "description": "Public Domain Classical Music Streaming",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1a1a",
+  "theme_color": "#8B4513",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/screenshots/home.png",
+      "sizes": "540x720",
+      "type": "image/png"
+    }
+  ],
+  "categories": ["music", "entertainment"],
+  "shortcuts": [
+    {
+      "name": "Browse Composers",
+      "url": "/composers",
+      "description": "Explore classical composers"
+    },
+    {
+      "name": "My Library",
+      "url": "/library",
+      "description": "Your saved music"
+    }
+  ]
+}
+```
+
+**Service Worker Strategy:**
+```javascript
+// Workbox caching strategy
+workbox.routing.registerRoute(
+  // Audio files: Network first, cache fallback
+  ({url}) => url.pathname.endsWith('.mp3') || url.pathname.endsWith('.flac'),
+  new workbox.strategies.NetworkFirst({
+    cacheName: 'audio-cache',
+    plugins: [
+      new workbox.expiration.ExpirationPlugin({
+        maxEntries: 50,
+        maxAgeSeconds: 30 * 24 * 60 * 60, // 30 days
+      }),
+      new workbox.cacheableResponse.CacheableResponsePlugin({
+        statuses: [0, 200],
+      }),
+    ],
+  })
+);
+
+// API calls: Network first with timeout
+workbox.routing.registerRoute(
+  ({url}) => url.pathname.startsWith('/api/'),
+  new workbox.strategies.NetworkFirst({
+    cacheName: 'api-cache',
+    plugins: [
+      new workbox.expiration.ExpirationPlugin({
+        maxAgeSeconds: 5 * 60, // 5 minutes
+      }),
+    ],
+  })
+);
+
+// Static assets: Cache first
+workbox.routing.registerRoute(
+  ({request}) => ['style', 'script', 'image'].includes(request.destination),
+  new workbox.strategies.CacheFirst({
+    cacheName: 'static-cache',
+    plugins: [
+      new workbox.expiration.ExpirationPlugin({
+        maxEntries: 100,
+        maxAgeSeconds: 7 * 24 * 60 * 60, // 7 days
+      }),
+    ],
+  })
+);
+```
+
+### Audio Player Implementation
+
+**Core Player Features:**
+```typescript
+interface AudioPlayerState {
+  currentTrack: AudioTrack | null;
+  queue: AudioTrack[];
+  playbackState: 'playing' | 'paused' | 'loading' | 'stopped';
+  currentTime: number;
+  duration: number;
+  volume: number;
+  playbackRate: number; // For tempo adjustments
+  gaplessEnabled: boolean;
+  repeatMode: 'none' | 'one' | 'all';
+  shuffleEnabled: boolean;
+  crossfadeMs: number; // For movement transitions
+}
+
+interface AudioTrack {
+  id: string;
+  workId: string;
+  movementId: string | null;
+  movementNumber: number | null;
+  title: string;
+  composer: string;
+  performers: Performer[];
+  audioUrl: string;
+  duration: number;
+  artwork: string;
+  nextTrack?: AudioTrack; // For gapless playback pre-buffering
+}
+
+// Gapless playback implementation
+class GaplessAudioPlayer {
+  private currentAudio: HTMLAudioElement;
+  private nextAudio: HTMLAudioElement;
+  
+  preloadNext(track: AudioTrack) {
+    this.nextAudio = new Audio(track.audioUrl);
+    this.nextAudio.preload = 'auto';
+    this.nextAudio.volume = this.currentAudio.volume;
+  }
+  
+  switchToNext() {
+    // Seamless transition without gap
+    this.currentAudio.pause();
+    this.currentAudio = this.nextAudio;
+    this.currentAudio.play();
+  }
+}
+```
+
+**Media Session API Integration:**
+```javascript
+// Lock screen controls
+if ('mediaSession' in navigator) {
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: 'Symphony No. 5 - I. Allegro con brio',
+    artist: 'Herbert von Karajan, Berlin Philharmonic',
+    album: 'Beethoven: Symphony No. 5',
+    artwork: [
+      { src: '/artwork/beethoven-5-96.png', sizes: '96x96', type: 'image/png' },
+      { src: '/artwork/beethoven-5-512.png', sizes: '512x512', type: 'image/png' }
+    ]
+  });
+
+  navigator.mediaSession.setActionHandler('play', () => player.play());
+  navigator.mediaSession.setActionHandler('pause', () => player.pause());
+  navigator.mediaSession.setActionHandler('previoustrack', () => player.previous());
+  navigator.mediaSession.setActionHandler('nexttrack', () => player.next());
+  navigator.mediaSession.setActionHandler('seekbackward', (details) => {
+    player.currentTime -= details.seekOffset || 10;
+  });
+  navigator.mediaSession.setActionHandler('seekforward', (details) => {
+    player.currentTime += details.seekOffset || 10;
+  });
+}
+```
+
+## Backend Specifications
+
+### Content Service API
+
+**Tech Stack:**
+- Runtime: Node.js 20 LTS
+- Framework: Express.js 4.x / Fastify 4.x
+- Language: TypeScript
+- Validation: Zod
+- ORM: Prisma
+
+**Key Endpoints:**
+
+```typescript
+// GET /api/composers
+// Returns paginated list of composers with filters
+GET /api/composers?era=baroque&nationality=german&page=1&limit=50
+
+Response: {
+  data: [
+    {
+      id: "uuid",
+      name: "Johann Sebastian Bach",
+      birthYear: 1685,
+      deathYear: 1750,
+      era: "Baroque",
+      nationality: "German",
+      portraitUrl: "https://cdn.../bach.jpg",
+      worksCount: 847
+    }
+  ],
+  pagination: {
+    page: 1,
+    limit: 50,
+    total: 150,
+    totalPages: 3
+  }
+}
+
+// GET /api/works/:workId
+// Returns complete work information with all recordings
+GET /api/works/550e8400-e29b-41d4-a716-446655440000
+
+Response: {
+  id: "550e8400-e29b-41d4-a716-446655440000",
+  title: "Symphony No. 5",
+  subtitle: null,
+  composer: {
+    id: "...",
+    name: "Ludwig van Beethoven"
+  },
+  catalogNumber: "Op. 67",
+  key: "C Minor",
+  form: "Symphony",
+  instrumentation: ["Orchestra"],
+  compositionYear: 1808,
+  duration: 33,
+  movements: [
+    {
+      number: 1,
+      title: "Allegro con brio",
+      tempoMarking: "Allegro con brio",
+      key: "C Minor",
+      duration: 450
+    },
+    // ... movements 2-4
+  ],
+  recordings: [
+    {
+      id: "...",
+      releaseYear: 1963,
+      conductor: "Herbert von Karajan",
+      orchestra: "Berlin Philharmonic",
+      label: "Deutsche Grammophon",
+      audioQuality: "MP3 320kbps",
+      license: "Public Domain"
+    }
+  ],
+  programNotes: {
+    composition: "Composed in 1804-1808...",
+    premiere: "December 22, 1808 at the Theater an der Wien...",
+    structure: "The famous 'fate knocking' motif..."
+  }
+}
+
+// POST /api/search
+// Advanced multi-field search
+POST /api/search
+Body: {
+  query: "moonlight sonata",
+  filters: {
+    composer: ["beethoven"],
+    form: ["sonata"],
+    instrumentation: ["piano"],
+    era: ["classical", "romantic"],
+    minYear: 1800,
+    maxYear: 1850
+  },
+  sort: "relevance", // or "year", "title", "composer"
+  page: 1,
+  limit: 20
+}
+
+Response: {
+  results: [
+    {
+      type: "work",
+      work: { /* work object */ },
+      relevance: 0.95
+    }
+  ],
+  facets: {
+    composers: [
+      { name: "Beethoven", count: 15 },
+      { name: "Mozart", count: 3 }
+    ],
+    forms: [
+      { name: "Sonata", count: 12 },
+      { name: "Concerto", count: 6 }
+    ]
+  }
+}
+
+// GET /api/playlists/:playlistId
+// Returns curated or user playlists
+GET /api/playlists/romantic-piano
+
+Response: {
+  id: "romantic-piano",
+  title: "Essential Romantic Piano",
+  description: "The most beautiful piano works from the Romantic era",
+  curator: "ClassicalStream",
+  trackCount: 25,
+  duration: 7200,
+  tracks: [
+    {
+      workId: "...",
+      recordingId: "...",
+      movements: [1, 2, 3], // Which movements to include
+      trackOrder: 1
+    }
+  ],
+  coverArt: "https://cdn.../romantic-piano.jpg"
+}
+```
+
+### Audio Delivery Service
+
+**Architecture:**
+- Storage: AWS S3 / Cloudflare R2
+- CDN: Cloudflare / BunnyCDN
+- Streaming Protocol: Progressive download (HTTP) with optional HLS for adaptive
+
+**File Organization:**
+```
+/audio/
+  /composers/
+    /bach/
+      /bwv-1080/
+        /recording-1963-karajan/
+          movement-1.mp3
+          movement-2.mp3
+          metadata.json
+```
+
+**CDN Configuration:**
+```javascript
+// Cloudflare Workers for audio delivery with analytics
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    
+    // Log play event
+    await env.ANALYTICS.writeDataPoint({
+      blobs: [url.pathname],
+      indexes: [
+        request.headers.get('CF-IPCountry'),
+        request.headers.get('User-Agent')
+      ]
+    });
+    
+    // Serve from R2 with cache
+    const object = await env.R2.get(url.pathname);
+    
+    if (!object) {
+      return new Response('Not Found', { status: 404 });
+    }
+    
+    const headers = new Headers();
+    object.writeHttpMetadata(headers);
+    headers.set('Cache-Control', 'public, max-age=31536000'); // 1 year
+    headers.set('Accept-Ranges', 'bytes'); // Enable range requests
+    
+    return new Response(object.body, { headers });
+  }
+};
+```
+
+**Adaptive Bitrate (Optional Enhancement):**
+```javascript
+// HLS manifest generation for bandwidth adaptation
+function generateHLSManifest(track) {
+  return `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=128000,RESOLUTION=320x320
+/audio/${track.id}/128k/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=320000,RESOLUTION=640x640
+/audio/${track.id}/320k/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x1280
+/audio/${track.id}/flac/playlist.m3u8`;
+}
+```
+
+### Ad Service Integration
+
+**Google Ad Manager Implementation:**
+
+```javascript
+// Ad slot definitions
+const adSlots = {
+  audioPreRoll: {
+    type: 'audio',
+    duration: 15,
+    position: 'pre-roll'
+  },
+  audioMidRoll: {
+    type: 'audio',
+    duration: 30,
+    position: 'mid-roll',
+    frequency: 'every-15-minutes'
+  },
+  displayBanner: {
+    type: 'display',
+    size: '728x90',
+    position: 'player-bottom'
+  }
+};
+
+// Audio ad insertion logic
+class AdInsertionEngine {
+  private playbackTime: number = 0;
+  private lastAdTime: number = 0;
+  
+  shouldShowAd(): boolean {
+    const timeSinceLastAd = this.playbackTime - this.lastAdTime;
+    return timeSinceLastAd >= 15 * 60; // 15 minutes
+  }
+  
+  async insertAd() {
+    // Pause current playback
+    player.pause();
+    
+    // Request ad from Google Ad Manager
+    const ad = await this.requestAd({
+      targetingParams: {
+        composer: currentTrack.composer,
+        era: currentTrack.era,
+        genre: 'classical'
+      }
+    });
+    
+    // Play ad audio
+    await this.playAdAudio(ad.audioUrl);
+    
+    // Track completion
+    this.reportAdImpression(ad.id);
+    
+    // Resume content
+    player.play();
+    this.lastAdTime = this.playbackTime;
+  }
+}
+
+// Google Ad Manager integration
+googletag.cmd.push(() => {
+  const audioSlot = googletag.defineSlot(
+    '/12345678/audio-stream',
+    [1, 1],
+    'audio-ad-slot'
+  );
+  
+  audioSlot.setTargeting('genre', 'classical');
+  audioSlot.setTargeting('era', currentEra);
+  audioSlot.addService(googletag.pubads());
+  
+  googletag.pubads().enableSingleRequest();
+  googletag.enableServices();
+});
+```
+
+### User Service
+
+**Authentication:**
+- OAuth 2.0 (Google, Apple Sign-In)
+- JWT tokens for session management
+- Optional anonymous users with device ID
+
+**User Data Schema:**
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  email VARCHAR(255) UNIQUE,
+  display_name VARCHAR(100),
+  created_at TIMESTAMP DEFAULT NOW(),
+  last_login TIMESTAMP,
+  subscription_tier VARCHAR(20) DEFAULT 'free',
+  preferences JSONB
+);
+
+CREATE TABLE listening_history (
+  id UUID PRIMARY KEY,
+  user_id UUID REFERENCES users(id),
+  work_id UUID REFERENCES works(id),
+  recording_id UUID REFERENCES recordings(id),
+  played_at TIMESTAMP,
+  duration_seconds INT,
+  completion_percentage INT
+);
+
+CREATE TABLE user_playlists (
+  id UUID PRIMARY KEY,
+  user_id UUID REFERENCES users(id),
+  title VARCHAR(255),
+  description TEXT,
+  is_public BOOLEAN DEFAULT false,
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP
+);
+
+CREATE TABLE playlist_tracks (
+  playlist_id UUID REFERENCES user_playlists(id),
+  work_id UUID REFERENCES works(id),
+  recording_id UUID REFERENCES recordings(id),
+  track_order INT,
+  movements INT[] -- Which movements to include
+);
+
+CREATE TABLE favorites (
+  user_id UUID REFERENCES users(id),
+  work_id UUID REFERENCES works(id),
+  favorited_at TIMESTAMP,
+  PRIMARY KEY (user_id, work_id)
+);
+```
+
+## Database Schema (Complete)
+
+**Full PostgreSQL Schema:**
+```sql
+-- See README.md for core tables
+-- Additional indexes for performance
+
+CREATE INDEX idx_works_composer ON works(composer_id);
+CREATE INDEX idx_works_form ON works(form);
+CREATE INDEX idx_works_era ON works USING GIN(to_tsvector('english', form));
+CREATE INDEX idx_recordings_work ON recordings(work_id);
+CREATE INDEX idx_audio_files_recording ON audio_files(recording_id);
+
+-- Full-text search
+CREATE INDEX idx_works_fulltext ON works 
+  USING GIN(to_tsvector('english', title || ' ' || COALESCE(subtitle, '')));
+CREATE INDEX idx_composers_fulltext ON composers 
+  USING GIN(to_tsvector('english', name));
+
+-- Performance views
+CREATE MATERIALIZED VIEW popular_works AS
+SELECT 
+  w.id,
+  w.title,
+  c.name as composer_name,
+  COUNT(lh.id) as play_count
+FROM works w
+JOIN composers c ON w.composer_id = c.id
+LEFT JOIN listening_history lh ON lh.work_id = w.id
+WHERE lh.played_at > NOW() - INTERVAL '30 days'
+GROUP BY w.id, w.title, c.name
+ORDER BY play_count DESC;
+```
+
+## Performance Requirements
+
+### Response Time Targets
+- API endpoint response: < 200ms (p95)
+- Search query: < 500ms (p95)
+- Audio stream start: < 1 second
+- Page load (cached): < 2 seconds
+- Page load (fresh): < 4 seconds
+
+### Scalability Targets
+- Concurrent users: 10,000 (Phase 1), 100,000 (Phase 2)
+- Audio bandwidth: 50 Mbps (Phase 1), 500 Mbps (Phase 2)
+- API requests: 10,000 req/min (Phase 1), 100,000 req/min (Phase 2)
+- Database queries: < 100ms average
+
+### Availability
+- Uptime: 99.9% (Phase 1), 99.95% (Phase 2)
+- CDN availability: 99.99%
+- Database replication: Multi-AZ with automatic failover
+
+## Security Specifications
+
+### Application Security
+- HTTPS only (TLS 1.3)
+- Content Security Policy (CSP) headers
+- CORS policy: Whitelist approved domains
+- Rate limiting: 100 req/min per IP for API, 1000 req/min for CDN
+- DDoS protection: Cloudflare
+
+### Data Protection
+- PII encryption at rest (AES-256)
+- Secure password hashing (bcrypt, 12 rounds)
+- JWT token expiration: 24 hours
+- Refresh tokens: 30 days with rotation
+
+### Content Protection
+- Referrer validation for audio files
+- Time-limited signed URLs for premium content
+- Download throttling: 50 tracks/day for free tier
+
+## Analytics & Monitoring
+
+### Key Metrics
+```javascript
+// Analytics events to track
+const analyticsEvents = {
+  // User engagement
+  'track_play': { workId, recordingId, source },
+  'track_complete': { workId, completionPercentage },
+  'search_query': { query, resultsCount },
+  'playlist_create': { playlistId, trackCount },
+  
+  // Performance
+  'audio_buffer_stall': { workId, bufferDuration },
+  'api_latency': { endpoint, duration },
+  
+  // Monetization
+  'ad_impression': { adId, adType, placement },
+  'ad_click': { adId, adType },
+  'premium_conversion': { userId, tier }
+};
+
+// Monitoring stack
+const monitoring = {
+  apm: 'New Relic / Datadog',
+  logs: 'CloudWatch / Loki',
+  metrics: 'Prometheus + Grafana',
+  errors: 'Sentry',
+  uptime: 'Pingdom / UptimeRobot'
+};
+```
+
+## Development & Deployment
+
+### Development Environment
+```yaml
+# docker-compose.yml for local development
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: classicalstream
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "5432:5432"
+  
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  
+  api:
+    build: ./backend
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgresql://postgres:dev_password@postgres:5432/classicalstream
+      REDIS_URL: redis://redis:6379
+  
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:3001
+```
+
+### CI/CD Pipeline
+```yaml
+# GitHub Actions workflow
+name: Deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run tests
+        run: npm test
+  
+  deploy-frontend:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Vercel
+        run: vercel --prod
+  
+  deploy-backend:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to AWS
+        run: aws deploy create-deployment
+```
+
+### Hosting Costs (Estimates)
+
+**Phase 1 (1,000 MAU):**
+- Vercel/Netlify: $0 (free tier)
+- Cloudflare Workers: $5/month
+- Cloudflare R2: $15/month (1TB storage)
+- Supabase PostgreSQL: $25/month
+- Total: ~$45/month
+
+**Phase 2 (10,000 MAU):**
+- Web hosting: $50/month
+- API servers: $200/month (AWS/GCP)
+- CDN bandwidth: $100/month (10TB)
+- Database: $100/month
+- Total: ~$450/month
+
+**Phase 3 (100,000 MAU):**
+- Web hosting: $200/month
+- API servers: $1,000/month
+- CDN bandwidth: $1,000/month (100TB)
+- Database: $500/month
+- Total: ~$2,700/month
+
+Revenue should cover costs at ~1,000 MAU with advertising.
+
+---
+
+**Version**: 1.0
+**Last Updated**: November 2025
