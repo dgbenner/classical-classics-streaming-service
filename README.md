@@ -1,5 +1,3 @@
-# classical-classics-streaming-service
-
 # ClassicalStream - Public Domain Classical Music Streaming Platform
 
 A Progressive Web App (PWA) for streaming curated public domain classical music with integrated advertising monetization.
